@@ -8,6 +8,7 @@ package com.amazonaws.services.lambda.runtime.api.client;
 import com.amazonaws.services.lambda.runtime.LambdaLogger;
 import com.amazonaws.services.lambda.runtime.api.client.logging.LambdaContextLogger;
 import com.amazonaws.services.lambda.runtime.api.client.logging.StdOutLogSink;
+import com.amazonaws.services.lambda.runtime.api.client.runtimeapi.InvocationError;
 import com.amazonaws.services.lambda.runtime.api.client.util.EnvReader;
 import com.amazonaws.services.lambda.runtime.api.client.util.EnvWriter;
 import com.amazonaws.services.lambda.runtime.api.client.util.LambdaOutputStream;
@@ -73,9 +74,9 @@ public class AWSLambda {
         // The ca-certificates package provides /etc/pki/java/cacerts which becomes the symlink destination
         // of $java_home/lib/security/cacerts when java is installed in the chroot. Given that java is provided
         // in /var/lang as opposed to installed in the chroot, this brings it closer.
-        if(System.getProperty(TRUST_STORE_PROPERTY) == null) {
+        if (System.getProperty(TRUST_STORE_PROPERTY) == null) {
             final File systemCacerts = new File("/etc/pki/java/cacerts");
-            if(systemCacerts.exists() && systemCacerts.isFile()) {
+            if (systemCacerts.exists() && systemCacerts.isFile()) {
                 System.setProperty(TRUST_STORE_PROPERTY, systemCacerts.getPath());
             }
         }
@@ -122,9 +123,9 @@ public class AWSLambda {
         final LambdaRequestHandler requestHandler = EventHandlerLoader.loadEventHandler(handlerInfo);
         // if loading the handler failed and the failure is fatal (for e.g. the constructor threw an exception)
         // we want to report this as an init error rather than deferring to the first invoke.
-        if(requestHandler instanceof UserFaultHandler) {
-            UserFault userFault =((UserFaultHandler) requestHandler).fault;
-            if(userFault.fatal) {
+        if (requestHandler instanceof UserFaultHandler) {
+            UserFault userFault = ((UserFaultHandler) requestHandler).fault;
+            if (userFault.fatal) {
                 throw userFault;
             }
         }
@@ -133,6 +134,7 @@ public class AWSLambda {
         try {
             initHandler = wrapInitCall(handlerInfo.clazz.getMethod("init"));
         } catch (NoSuchMethodException | NoClassDefFoundError e) {
+            //noop
         }
 
         return new UserMethods(initHandler, requestHandler);
@@ -160,7 +162,7 @@ public class AWSLambda {
 
     public static String getEnvOrExit(String envVariableName) {
         String value = System.getenv(envVariableName);
-        if(value == null) {
+        if (value == null) {
             System.err.println("Could not get environment variable " + envVariableName);
             System.exit(-1);
         }
@@ -171,7 +173,7 @@ public class AWSLambda {
 
     private static LogSink createLogSink() {
         final String fd = System.getenv("_LAMBDA_TELEMETRY_LOG_FD");
-        if(fd == null) {
+        if (fd == null) {
             return new StdOutLogSink();
         }
 
@@ -229,7 +231,10 @@ public class AWSLambda {
             ByteArrayOutputStream payload = new ByteArrayOutputStream(1024);
             Failure failure = new Failure(userFault);
             GsonFactory.getInstance().getSerializer(Failure.class).toJson(failure, payload);
-            runtimeClient.postInitError(payload.toByteArray(), failure.getErrorType());
+            InvocationError invocationError = InvocationError.newBuilder(payload.toByteArray())
+                    .setErrorType(failure.getErrorType())
+                    .build();
+            runtimeClient.postInitError(invocationError);
             System.exit(1);
             return;
         }
@@ -257,7 +262,7 @@ public class AWSLambda {
                 try {
                     payload = methods.requestHandler.call(request);
                     // TODO calling payload.toByteArray() creates a new copy of the underlying buffer
-                    runtimeClient.postInvocationResponse(request.getId(), payload.toByteArray());
+                    runtimeClient.postInvocationSuccess(request.getId(), payload.toByteArray());
                 } catch (UserFault f) {
                     userFault = f;
                     UserFault.filterStackTrace(f);
@@ -265,17 +270,25 @@ public class AWSLambda {
                     Failure failure = new Failure(f);
                     GsonFactory.getInstance().getSerializer(Failure.class).toJson(failure, payload);
                     shouldExit = f.fatal;
-                    runtimeClient.postInvocationError(request.getId(), payload.toByteArray(), failure.getErrorType());
+                    InvocationError invocationError = InvocationError.newBuilder(payload.toByteArray())
+                            .setId(request.getId())
+                            .setErrorType(failure.getErrorType())
+                            .build();
+                    runtimeClient.postInvocationError(invocationError);
                 } catch (Throwable t) {
                     UserFault.filterStackTrace(t);
-                    userFault = UserFault.makeUserFault(t);
+                    userFault = makeUserFault(t);
                     payload = new ByteArrayOutputStream(1024);
                     Failure failure = new Failure(t);
                     GsonFactory.getInstance().getSerializer(Failure.class).toJson(failure, payload);
                     // These two categories of errors are considered fatal.
                     shouldExit = Failure.isInvokeFailureFatal(t);
-                    runtimeClient.postInvocationError(request.getId(), payload.toByteArray(), failure.getErrorType(),
-                            serializeAsXRayJson(t));
+                    InvocationError invocationError = InvocationError.newBuilder(payload.toByteArray())
+                            .setId(request.getId())
+                            .setErrorType(failure.getErrorType())
+                            .setErrorCause(serializeAsXRayJson(t))
+                            .build();
+                    runtimeClient.postInvocationError(invocationError);
                 } finally {
                     if (userFault != null) {
                         lambdaLogger.log(userFault.reportableError());
@@ -288,7 +301,6 @@ public class AWSLambda {
     private static PojoSerializer<XRayErrorCause> xRayErrorCauseSerializer;
 
     /**
-     *
      * @param throwable throwable to convert
      * @return json as string expected by XRay's web console. On conversion failure, returns null.
      */
@@ -296,7 +308,7 @@ public class AWSLambda {
         try {
             final OutputStream outputStream = new ByteArrayOutputStream();
             final XRayErrorCause cause = new XRayErrorCause(throwable);
-            if(xRayErrorCauseSerializer == null) {
+            if (xRayErrorCauseSerializer == null) {
                 xRayErrorCauseSerializer = JacksonFactory.getInstance().getSerializer(XRayErrorCause.class);
             }
             xRayErrorCauseSerializer.toJson(cause, outputStream);
