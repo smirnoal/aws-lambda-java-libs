@@ -1,5 +1,11 @@
 package com.amazonaws.services.lambda.runtime.api.client.runtimeapi;
 
+import software.amazon.awssdk.http.SdkHttpMethod;
+import software.amazon.awssdk.http.SdkHttpRequest;
+import software.amazon.awssdk.http.async.AsyncExecuteRequest;
+import software.amazon.awssdk.http.async.SdkAsyncHttpClient;
+import software.amazon.awssdk.http.crt.AwsCrtAsyncHttpClient;
+
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -29,16 +35,11 @@ public class LambdaRuntimeClient {
     private static final String XRAY_ERROR_CAUSE_HEADER = "Lambda-Runtime-Function-XRay-Error-Cause";
     private static final String ERROR_TYPE_HEADER = "Lambda-Runtime-Function-Error-Type";
 
-    private static final String REQUEST_ID_HEADER = "lambda-runtime-aws-request-id";
-    private static final String FUNCTION_ARN_HEADER = "lambda-runtime-invoked-function-arn";
-    private static final String DEADLINE_MS_HEADER = "lambda-runtime-deadline-ms";
-    private static final String TRACE_ID_HEADER = "lambda-runtime-trace-id";
-    private static final String CLIENT_CONTEXT_HEADER = "lambda-runtime-client-context";
-    private static final String COGNITO_IDENTITY_HEADER = "lambda-runtime-cognito-identity";
-
     private static final String USER_AGENT = String.format(
             "aws-lambda-java/%s",
             System.getProperty("java.vendor.version"));
+
+    private static final NextRequestHandler NEXT_REQUEST_HANDLER = new NextRequestHandler();
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
@@ -46,44 +47,38 @@ public class LambdaRuntimeClient {
             .connectTimeout(Duration.ofDays(1))
             .build();
 
-    private final String hostnamePort;
-    private final HttpRequest nextRequest;
+    private static final SdkAsyncHttpClient CRT_HTTP_CLIENT = AwsCrtAsyncHttpClient.builder().build();
 
+    public static final EmptyContentPublisher EMPTY_CONTENT_PUBLISHER = new EmptyContentPublisher();
+
+    private final String hostnamePort;
+
+    private final AsyncExecuteRequest nextRequest;
 
     public LambdaRuntimeClient(String hostnamePort) {
         Objects.requireNonNull(hostnamePort, "hostnamePort cannot be null");
         this.hostnamePort = hostnamePort;
-        nextRequest = HttpRequest.newBuilder(URI.create(String.format(NEXT_URL_TEMPLATE, hostnamePort)))
-                .header("User-Agent", USER_AGENT)
-                .GET()
+        this.nextRequest = AsyncExecuteRequest.builder()
+                .fullDuplex(false)
+                .responseHandler(NEXT_REQUEST_HANDLER)
+                .requestContentPublisher(EMPTY_CONTENT_PUBLISHER)
+                .request(SdkHttpRequest.builder()
+                        .uri(URI.create(String.format(NEXT_URL_TEMPLATE, hostnamePort)))
+                        .appendHeader("User-Agent", USER_AGENT)
+                        .method(SdkHttpMethod.GET)
+                        .build())
                 .build();
     }
 
     public InvocationRequest waitForNextInvocation() {
-        HttpResponse<byte[]> response;
+
         try {
-            response = HTTP_CLIENT.send(nextRequest, HttpResponse.BodyHandlers.ofByteArray());
+            CRT_HTTP_CLIENT.execute(nextRequest).get();
         } catch (Exception e) {
             throw new LambdaRuntimeClientException("Failed to get next invoke", e);
         }
 
-        return invocationRequestFromHttpResponse(response);
-    }
-
-    private InvocationRequest invocationRequestFromHttpResponse(HttpResponse<byte[]> response) {
-        InvocationRequest result = new InvocationRequest();
-
-        result.id = response.headers().firstValue(REQUEST_ID_HEADER).orElseThrow(
-                () -> new LambdaRuntimeClientException("Request ID absent"));
-        result.invokedFunctionArn = response.headers().firstValue(FUNCTION_ARN_HEADER).orElseThrow(
-                () -> new LambdaRuntimeClientException("Function ARN absent"));
-        result.deadlineTimeInMs = Long.parseLong(response.headers().firstValue(DEADLINE_MS_HEADER).orElse("0"));
-        result.xrayTraceId = response.headers().firstValue(TRACE_ID_HEADER).orElse(null);
-        result.clientContext = response.headers().firstValue(CLIENT_CONTEXT_HEADER).orElse(null);
-        result.cognitoIdentity = response.headers().firstValue(COGNITO_IDENTITY_HEADER).orElse(null);
-        result.content = response.body();
-
-        return result;
+        return NEXT_REQUEST_HANDLER.getInvocationRequest();
     }
 
     public void postInvocationSuccess(String requestId, byte[] response) {
