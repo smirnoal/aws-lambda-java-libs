@@ -1,11 +1,11 @@
 package com.amazonaws.services.lambda.runtime.api.client.runtimeapi;
 
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
 import java.io.IOException;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Duration;
 import java.util.Objects;
 
 import static java.net.HttpURLConnection.HTTP_ACCEPTED;
@@ -40,80 +40,83 @@ public class LambdaRuntimeClient {
             "aws-lambda-java/%s",
             System.getProperty("java.vendor.version"));
 
-    private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
-            .version(HttpClient.Version.HTTP_1_1)
-            .followRedirects(HttpClient.Redirect.NEVER)
-            .connectTimeout(Duration.ofDays(1))
-            .build();
+    private static final OkHttpClient HTTP_CLIENT = new OkHttpClient();
 
     private final String hostnamePort;
-    private final HttpRequest nextRequest;
+    private final Request nextRequest;
 
 
     public LambdaRuntimeClient(String hostnamePort) {
         Objects.requireNonNull(hostnamePort, "hostnamePort cannot be null");
         this.hostnamePort = hostnamePort;
-        nextRequest = HttpRequest.newBuilder(URI.create(String.format(NEXT_URL_TEMPLATE, hostnamePort)))
+        nextRequest = new Request.Builder()
+                .url(String.format(NEXT_URL_TEMPLATE, hostnamePort))
                 .header("User-Agent", USER_AGENT)
-                .GET()
+                .get()
                 .build();
     }
 
     public InvocationRequest waitForNextInvocation() {
-        HttpResponse<byte[]> response;
-        try {
-            response = HTTP_CLIENT.send(nextRequest, HttpResponse.BodyHandlers.ofByteArray());
-        } catch (Exception e) {
+        try (Response response = HTTP_CLIENT.newCall(nextRequest).execute()) {
+            return invocationRequestFromHttpResponse(response);
+        } catch (IOException e) {
             throw new LambdaRuntimeClientException("Failed to get next invoke", e);
         }
-
-        return invocationRequestFromHttpResponse(response);
     }
 
-    private InvocationRequest invocationRequestFromHttpResponse(HttpResponse<byte[]> response) {
+    private InvocationRequest invocationRequestFromHttpResponse(Response response) throws IOException {
         InvocationRequest result = new InvocationRequest();
 
-        result.id = response.headers().firstValue(REQUEST_ID_HEADER).orElseThrow(
-                () -> new LambdaRuntimeClientException("Request ID absent"));
-        result.invokedFunctionArn = response.headers().firstValue(FUNCTION_ARN_HEADER).orElseThrow(
-                () -> new LambdaRuntimeClientException("Function ARN absent"));
-        result.deadlineTimeInMs = Long.parseLong(response.headers().firstValue(DEADLINE_MS_HEADER).orElse("0"));
-        result.xrayTraceId = response.headers().firstValue(TRACE_ID_HEADER).orElse(null);
-        result.clientContext = response.headers().firstValue(CLIENT_CONTEXT_HEADER).orElse(null);
-        result.cognitoIdentity = response.headers().firstValue(COGNITO_IDENTITY_HEADER).orElse(null);
-        result.content = response.body();
+        result.id = response.headers().get(REQUEST_ID_HEADER);
+        if (result.id == null) {
+            throw new LambdaRuntimeClientException("Request ID absent");
+        }
+
+        result.invokedFunctionArn = response.headers().get(FUNCTION_ARN_HEADER);
+        if (result.invokedFunctionArn == null) {
+            throw new LambdaRuntimeClientException("Function ARN absent");
+        }
+
+        String deadlineMs = response.headers().get(DEADLINE_MS_HEADER);
+        result.deadlineTimeInMs = deadlineMs == null ? 0 : Long.parseLong(deadlineMs);
+
+        result.xrayTraceId = response.headers().get(TRACE_ID_HEADER);
+        result.clientContext = response.headers().get(CLIENT_CONTEXT_HEADER);
+        result.cognitoIdentity = response.headers().get(COGNITO_IDENTITY_HEADER);
+
+        result.content = Objects.requireNonNull(response.body()).bytes();
 
         return result;
     }
 
-    public void postInvocationSuccess(String requestId, byte[] response) {
-        URI endpoint = URI.create(String.format(INVOCATION_SUCCESS_URL_TEMPLATE, hostnamePort, requestId));
-        HttpRequest invocationResponseRequest = HttpRequest.newBuilder(endpoint)
+    public void postInvocationSuccess(String requestId, byte[] payload) {
+        Request invocationResponseRequest = new Request.Builder()
+                .url(String.format(INVOCATION_SUCCESS_URL_TEMPLATE, hostnamePort, requestId))
                 .header("User-Agent", USER_AGENT)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(response))
+                .post(RequestBody.create(payload))
                 .build();
 
-        try {
-            HTTP_CLIENT.send(invocationResponseRequest, HttpResponse.BodyHandlers.discarding());
-        } catch (Exception e) {
+        try (Response response = HTTP_CLIENT.newCall(invocationResponseRequest).execute()) {
+        } catch (IOException e) {
             throw new LambdaRuntimeClientException("Failed to post invocation result", e);
         }
     }
 
     public void postInvocationError(InvocationError invocationError) {
-        URI endpoint = URI.create(String.format(INVOCATION_ERROR_URL_TEMPLATE, hostnamePort, invocationError.getId()));
+        String endpoint = String.format(INVOCATION_ERROR_URL_TEMPLATE, hostnamePort, invocationError.getId());
         post(endpoint, invocationError);
     }
 
     public void postInitError(InvocationError invocationError) {
-        URI endpoint = URI.create(String.format(INIT_ERROR_URL_TEMPLATE, hostnamePort));
+        String endpoint = String.format(INIT_ERROR_URL_TEMPLATE, hostnamePort);
         post(endpoint, invocationError);
     }
 
-    private void post(URI endpoint, InvocationError invocationError) {
+    private void post(String endpoint, InvocationError invocationError) {
 
-        HttpRequest.Builder request = HttpRequest.newBuilder(endpoint)
-                .POST(HttpRequest.BodyPublishers.ofByteArray(invocationError.getErrorResponse()))
+        Request.Builder request = new Request.Builder()
+                .url(endpoint)
+                .post(RequestBody.create(invocationError.getErrorResponse()))
                 .header("User-Agent", USER_AGENT)
                 .header("Content-Type", DEFAULT_CONTENT_TYPE);
 
@@ -124,16 +127,13 @@ public class LambdaRuntimeClient {
             request.header(XRAY_ERROR_CAUSE_HEADER, invocationError.getErrorCause().get());
         }
 
-        HttpResponse<Void> response;
-        try {
-            response = HTTP_CLIENT.send(request.build(), HttpResponse.BodyHandlers.discarding());
-        } catch (InterruptedException | IOException e) {
+        try (Response response = HTTP_CLIENT.newCall(request.build()).execute()) {
+            if (response.code() != HTTP_ACCEPTED) {
+                throw new LambdaRuntimeClientException(
+                        String.format("%s Response code: '%d'.", endpoint, response.code()));
+            }
+        } catch (IOException e) {
             throw new LambdaRuntimeClientException("Failed to post error", e);
-        }
-
-        if (response.statusCode() != HTTP_ACCEPTED) {
-            throw new LambdaRuntimeClientException(
-                    String.format("%s Response code: '%d'.", endpoint, response.statusCode()));
         }
     }
 }
