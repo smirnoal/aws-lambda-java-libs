@@ -6,7 +6,9 @@ import okhttp3.RequestBody;
 import okhttp3.Response;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 
 import static java.net.HttpURLConnection.HTTP_ACCEPTED;
 
@@ -40,7 +42,12 @@ public class LambdaRuntimeClient {
             "aws-lambda-java/%s",
             System.getProperty("java.vendor.version"));
 
-    private static final OkHttpClient HTTP_CLIENT = new OkHttpClient();
+    private static final OkHttpClient HTTP_CLIENT = new OkHttpClient.Builder()
+            .readTimeout(Integer.MAX_VALUE, TimeUnit.MILLISECONDS)
+            .writeTimeout(Integer.MAX_VALUE, TimeUnit.MILLISECONDS)
+            .callTimeout(Integer.MAX_VALUE, TimeUnit.MILLISECONDS)
+            .connectTimeout(Integer.MAX_VALUE, TimeUnit.MILLISECONDS)
+            .build();
 
     private final String hostnamePort;
     private final Request nextRequest;
